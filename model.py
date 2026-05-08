@@ -1,6 +1,5 @@
 import math
 import random
-from random import random
 import torch
 import torch.nn as nn
 from torch.distributions import Normal, Independent
@@ -28,7 +27,7 @@ class FastCNN(nn.Module):
         x = x.permute(0, 2, 1)
         x_out = []
         for module in self.fast_cnn:
-            x_out.append(module(x).squeeze())
+            x_out.append(module(x).squeeze(-1))
         x_out = torch.cat(x_out, 1)
         return x_out
 
@@ -193,13 +192,13 @@ class CrossModule4Batch(nn.Module):
         corre_dim = text.shape[1]
         similarity = torch.matmul(text_in, image_in) / math.sqrt(corre_dim)
         correlation = self.softmax(similarity)
-        correlation_p = self.pooling(correlation).squeeze()
+        correlation_p = self.pooling(correlation).squeeze(-1)
         correlation_out = self.c_specific_2(correlation_p)
         return correlation_out
 
 
 class DetectionModule(nn.Module):
-    def __init__(self, feature_dim=64+16+16, h_dim=64):
+    def __init__(self, feature_dim=64+16+16, h_dim=64, num_classes=6):
         super(DetectionModule, self).__init__()
         self.encoding = EncodingPart()
         self.ambiguity_module = AmbiguityLearning()
@@ -214,7 +213,7 @@ class DetectionModule(nn.Module):
             nn.BatchNorm1d(h_dim),
             nn.ReLU(),
             # nn.Dropout(),
-            nn.Linear(h_dim, 2)
+            nn.Linear(h_dim, num_classes)
         )
 
     def forward(self, text_raw, image_raw, text, image):

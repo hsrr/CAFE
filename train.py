@@ -15,15 +15,15 @@ BATCH_SIZE = 64
 LR = 1e-3
 L2 = 0  # 1e-5
 NUM_EPOCH = 100
+NUM_CLASSES = 6
 
 
-def prepare_data(text, image, label):
-    nr_index = [i for i, l in enumerate(label) if l == 1]
-    text_nr = text[nr_index]
-    image_nr = image[nr_index]
-    fixed_text = copy.deepcopy(text_nr)
-    matched_image = copy.deepcopy(image_nr)
-    unmatched_image = copy.deepcopy(image_nr).roll(shifts=3, dims=0)
+def prepare_data(text, image):
+    # Build matched and mismatched pairs from the full batch so the
+    # auxiliary similarity task stays valid for arbitrary class counts.
+    fixed_text = copy.deepcopy(text)
+    matched_image = copy.deepcopy(image)
+    unmatched_image = copy.deepcopy(image).roll(shifts=1, dims=0)
     return fixed_text, matched_image, unmatched_image
 
 
@@ -35,6 +35,7 @@ def train():
     lr = LR
     l2 = L2
     num_epoch = NUM_EPOCH
+    num_classes = NUM_CLASSES
     
     # ---  Load Data  ---
     dataset_dir = 'data/twitter'
@@ -56,7 +57,7 @@ def train():
     # ---  Build Model & Trainer  ---
     similarity_module = SimilarityModule()  
     similarity_module.to(device)
-    detection_module = DetectionModule()  
+    detection_module = DetectionModule(num_classes=num_classes)  
     detection_module.to(device)
     loss_func_similarity = torch.nn.CosineEmbeddingLoss()
     loss_func_detection = torch.nn.CrossEntropyLoss()
@@ -88,7 +89,7 @@ def train():
             image = image.to(device)
             label = label.to(device)
 
-            fixed_text, matched_image, unmatched_image = prepare_data(text, image, label)
+            fixed_text, matched_image, unmatched_image = prepare_data(text, image)
             fixed_text.to(device)
             matched_image.to(device)
             unmatched_image.to(device)
@@ -128,7 +129,7 @@ def train():
 
             loss_similarity_total += loss_similarity.item() * (2 * fixed_text.shape[0])
             loss_detection_total += loss_detection.item() * text.shape[0]
-            similarity_count += (2 * fixed_text.shape[0] * 2)
+            similarity_count += (2 * fixed_text.shape[0])
             detection_count += text.shape[0]
 
         loss_similarity_train = loss_similarity_total / similarity_count
@@ -138,7 +139,12 @@ def train():
 
         # ---  Test  ---
 
-        acc_similarity_test, acc_detection_test, loss_similarity_test, loss_detection_test, cm_similarity, cm_detection = test(similarity_module, detection_module, test_loader)
+        acc_similarity_test, acc_detection_test, loss_similarity_test, loss_detection_test, cm_similarity, cm_detection = test(
+            similarity_module,
+            detection_module,
+            test_loader,
+            num_classes=num_classes,
+        )
 
         # ---  Output  ---
 
@@ -161,7 +167,7 @@ def train():
         print('{}\n'.format(cm_detection))
 
 
-def test(similarity_module, detection_module, test_loader):
+def test(similarity_module, detection_module, test_loader, num_classes=NUM_CLASSES):
     similarity_module.eval()
     detection_module.eval()
 
@@ -185,7 +191,7 @@ def test(similarity_module, detection_module, test_loader):
             image = image.to(device)
             label = label.to(device)
             
-            fixed_text, matched_image, unmatched_image = prepare_data(text, image, label)
+            fixed_text, matched_image, unmatched_image = prepare_data(text, image)
             fixed_text.to(device)
             matched_image.to(device)
             unmatched_image.to(device)
@@ -231,8 +237,12 @@ def test(similarity_module, detection_module, test_loader):
 
         acc_similarity_test = accuracy_score(similarity_pre_label_all, similarity_label_all)
         acc_detection_test = accuracy_score(detection_pre_label_all, detection_label_all)
-        cm_similarity = confusion_matrix(similarity_pre_label_all, similarity_label_all)
-        cm_detection = confusion_matrix(detection_pre_label_all, detection_label_all)
+        cm_similarity = confusion_matrix(similarity_label_all, similarity_pre_label_all, labels=[0, 1])
+        cm_detection = confusion_matrix(
+            detection_label_all,
+            detection_pre_label_all,
+            labels=list(range(num_classes)),
+        )
 
     return acc_similarity_test, acc_detection_test, loss_similarity_test, loss_detection_test, cm_similarity, cm_detection
 
