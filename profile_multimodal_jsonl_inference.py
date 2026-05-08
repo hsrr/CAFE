@@ -41,6 +41,16 @@ except ImportError:
     AutoModel = None
     AutoTokenizer = None
 
+try:
+    from tflite_runtime.interpreter import Interpreter as TFLiteRuntimeInterpreter
+except ImportError:
+    TFLiteRuntimeInterpreter = None
+
+try:
+    import tensorflow as tf
+except ImportError:
+    tf = None
+
 
 TASK_TEMPLATE = """The following are two questions about fake news detection.
 News Caption: {}.
@@ -189,7 +199,7 @@ class MultimodalBatchCollator:
         tokenizer: Any,
         image_size: int,
         max_text_tokens: int,
-        normalize_with_imagenet_stats: bool = True,
+        image_normalization: str = "imagenet",
     ) -> None:
         if transforms is None or InterpolationMode is None:
             raise ImportError("torchvision is required for image preprocessing.")
@@ -198,13 +208,15 @@ class MultimodalBatchCollator:
             transforms.Resize((image_size, image_size), interpolation=InterpolationMode.BICUBIC),
             transforms.ToTensor(),
         ]
-        if normalize_with_imagenet_stats:
+        if image_normalization == "imagenet":
             image_ops.append(
                 transforms.Normalize(
                     mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225),
                 )
             )
+        elif image_normalization != "zero_one":
+            raise ValueError(f"Unsupported image_normalization: {image_normalization}")
 
         self.tokenizer = tokenizer
         self.max_text_tokens = max_text_tokens
@@ -233,6 +245,87 @@ class MultimodalBatchCollator:
         }
 
 
+class TFLiteImageEncoder(nn.Module):
+    """Run a TFLite image encoder and return a torch tensor feature."""
+
+    def __init__(self, model_path: str, image_normalization: str) -> None:
+        super().__init__()
+        interpreter_cls = None
+        if TFLiteRuntimeInterpreter is not None:
+            interpreter_cls = TFLiteRuntimeInterpreter
+        elif tf is not None:
+            interpreter_cls = tf.lite.Interpreter
+        if interpreter_cls is None:
+            raise ImportError(
+                "A TFLite interpreter is required to use .tflite image encoders. "
+                "Install tflite-runtime or tensorflow."
+            )
+
+        self.image_normalization = image_normalization
+        self.interpreter = interpreter_cls(model_path=model_path)
+        self.interpreter.allocate_tensors()
+        self.input_details = self.interpreter.get_input_details()[0]
+        self.output_details = self.interpreter.get_output_details()[0]
+
+        output_shape = [int(dim) for dim in self.output_details["shape"] if int(dim) > 0]
+        if len(output_shape) <= 1:
+            self.output_dim = int(output_shape[0])
+        else:
+            self.output_dim = int(np.prod(output_shape[1:]))
+
+        if self.output_dim != 512:
+            raise ValueError(
+                f"TFLite image encoder output dim is {self.output_dim}, but CAFE expects a 512-d image feature. "
+                "Please provide a TFLite model exported before the final classifier head, or use a PyTorch ResNet-34 checkpoint."
+            )
+
+    def _maybe_resize_input(self, np_input: np.ndarray) -> None:
+        current_shape = tuple(int(dim) for dim in self.input_details["shape"])
+        if current_shape != tuple(np_input.shape):
+            self.interpreter.resize_tensor_input(self.input_details["index"], np_input.shape, strict=False)
+            self.interpreter.allocate_tensors()
+            self.input_details = self.interpreter.get_input_details()[0]
+            self.output_details = self.interpreter.get_output_details()[0]
+
+    def _prepare_input(self, pixel_values: torch.Tensor) -> np.ndarray:
+        np_input = pixel_values.detach().cpu().numpy()
+        input_shape = self.input_details["shape"]
+        expects_nhwc = len(input_shape) == 4 and int(input_shape[-1]) == 3
+        if expects_nhwc:
+            np_input = np.transpose(np_input, (0, 2, 3, 1))
+
+        input_dtype = self.input_details["dtype"]
+        if input_dtype == np.uint8:
+            if self.image_normalization == "imagenet":
+                raise ValueError(
+                    "This TFLite model expects uint8 image input, but the profiler is using ImageNet-normalized tensors. "
+                    "Please run with --image-normalization zero_one."
+                )
+            scale, zero_point = self.input_details.get("quantization", (0.0, 0))
+            np_input = np.clip(np_input * 255.0, 0.0, 255.0)
+            if scale and scale > 0:
+                np_input = np.round(np_input / scale + zero_point)
+            np_input = np.clip(np_input, 0, 255).astype(np.uint8)
+        else:
+            np_input = np_input.astype(np.float32)
+
+        return np_input
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        np_input = self._prepare_input(pixel_values)
+        self._maybe_resize_input(np_input)
+        self.interpreter.set_tensor(self.input_details["index"], np_input)
+        self.interpreter.invoke()
+        output = self.interpreter.get_tensor(self.output_details["index"])
+
+        scale, zero_point = self.output_details.get("quantization", (0.0, 0))
+        if np.issubdtype(output.dtype, np.integer) and scale and scale > 0:
+            output = (output.astype(np.float32) - zero_point) * scale
+
+        output = output.reshape(output.shape[0], -1).astype(np.float32)
+        return torch.from_numpy(output).to(pixel_values.device)
+
+
 class EndToEndCAFEWithEncoders(nn.Module):
     """
     End-to-end inference wrapper for raw text + raw image inputs.
@@ -253,6 +346,7 @@ class EndToEndCAFEWithEncoders(nn.Module):
         text_feature_dim: int = 200,
         use_pretrained_image_encoder: bool = True,
         image_encoder_weights_path: Optional[str] = None,
+        image_normalization: str = "imagenet",
     ) -> None:
         super().__init__()
         if AutoModel is None or resnet34 is None:
@@ -262,18 +356,24 @@ class EndToEndCAFEWithEncoders(nn.Module):
         text_hidden_size = int(self.text_encoder.config.hidden_size)
         self.text_projector = nn.Linear(text_hidden_size, text_feature_dim)
 
-        if image_encoder_weights_path:
-            weights = None
-        elif use_pretrained_image_encoder:
-            weights = ResNet34_Weights.IMAGENET1K_V1 if ResNet34_Weights is not None else None
+        if image_encoder_weights_path and image_encoder_weights_path.endswith(".tflite"):
+            self.image_encoder = TFLiteImageEncoder(
+                model_path=image_encoder_weights_path,
+                image_normalization=image_normalization,
+            )
         else:
-            weights = None
-        self.image_encoder = resnet34(weights=weights)
-        if image_encoder_weights_path:
-            checkpoint = torch.load(image_encoder_weights_path, map_location="cpu")
-            state_dict = extract_state_dict(checkpoint)
-            self.image_encoder.load_state_dict(state_dict, strict=True)
-        self.image_encoder.fc = nn.Identity()
+            if image_encoder_weights_path:
+                weights = None
+            elif use_pretrained_image_encoder:
+                weights = ResNet34_Weights.IMAGENET1K_V1 if ResNet34_Weights is not None else None
+            else:
+                weights = None
+            self.image_encoder = resnet34(weights=weights)
+            if image_encoder_weights_path:
+                checkpoint = torch.load(image_encoder_weights_path, map_location="cpu")
+                state_dict = extract_state_dict(checkpoint)
+                self.image_encoder.load_state_dict(state_dict, strict=True)
+            self.image_encoder.fc = nn.Identity()
 
         self.similarity_module = SimilarityModule()
         self.detection_module = DetectionModule(num_classes=num_classes)
@@ -322,6 +422,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-words", type=int, default=800)
     parser.add_argument("--max-text-tokens", type=int, default=200)
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument(
+        "--image-normalization",
+        type=str,
+        default="imagenet",
+        choices=("imagenet", "zero_one"),
+        help="Image normalization before the image encoder. Use zero_one for most uint8 TFLite models.",
+    )
     parser.add_argument("--synthetic-samples", type=int, default=64)
     parser.add_argument(
         "--text-encoder-name-or-path",
@@ -380,11 +487,6 @@ def validate_paths(args: argparse.Namespace) -> None:
         weight_path = Path(args.resnet34_weights_path)
         if not weight_path.exists():
             raise FileNotFoundError(f"ResNet-34 weights file not found: {args.resnet34_weights_path}")
-        if weight_path.suffix.lower() == ".tflite":
-            raise ValueError(
-                "The provided ResNet-34 file is a TFLite model. "
-                "This profiler expects PyTorch weights (.pth/.pt) for the image encoder."
-            )
 
 
 def is_tensor_state_dict(candidate: Any) -> bool:
@@ -496,6 +598,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> EndToEndCAFEW
         num_classes=args.num_classes,
         use_pretrained_image_encoder=not args.disable_pretrained_image_encoder,
         image_encoder_weights_path=args.resnet34_weights_path,
+        image_normalization=args.image_normalization,
     )
     model.to(device)
     model.eval()
@@ -525,6 +628,7 @@ def build_loader(dataset: Dataset, args: argparse.Namespace) -> DataLoader:
         tokenizer=tokenizer,
         image_size=args.image_size,
         max_text_tokens=args.max_text_tokens,
+        image_normalization=args.image_normalization,
     )
     return DataLoader(
         dataset,
