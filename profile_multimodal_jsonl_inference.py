@@ -80,6 +80,82 @@ MULTI_LABEL_MAP = {
 }
 
 
+def remap_resnet_checkpoint_to_torchvision(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Convert common wrapped/HuggingFace-style ResNet-34 checkpoints into the
+    torchvision naming expected by `torchvision.models.resnet34`.
+    """
+
+    remapped: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        normalized_key = key
+        if normalized_key.startswith("resnet."):
+            normalized_key = normalized_key[len("resnet.") :]
+
+        if normalized_key == "embedder.embedder.convolution.weight":
+            remapped["conv1.weight"] = value
+            continue
+
+        if normalized_key.startswith("embedder.embedder.normalization."):
+            suffix = normalized_key.split("embedder.embedder.normalization.", 1)[1]
+            remapped[f"bn1.{suffix}"] = value
+            continue
+
+        stage_match = re.match(
+            r"encoder\.stages\.(\d+)\.layers\.(\d+)\.layer\.(\d+)\.(convolution|normalization)\.(.+)",
+            normalized_key,
+        )
+        if stage_match:
+            stage_index = int(stage_match.group(1)) + 1
+            block_index = int(stage_match.group(2))
+            sublayer_index = int(stage_match.group(3)) + 1
+            op_type = stage_match.group(4)
+            suffix = stage_match.group(5)
+
+            if op_type == "convolution":
+                remapped[f"layer{stage_index}.{block_index}.conv{sublayer_index}.{suffix}"] = value
+            else:
+                remapped[f"layer{stage_index}.{block_index}.bn{sublayer_index}.{suffix}"] = value
+            continue
+
+        shortcut_match = re.match(
+            r"encoder\.stages\.(\d+)\.layers\.(\d+)\.shortcut\.(convolution|normalization)\.(.+)",
+            normalized_key,
+        )
+        if shortcut_match:
+            stage_index = int(shortcut_match.group(1)) + 1
+            block_index = int(shortcut_match.group(2))
+            op_type = shortcut_match.group(3)
+            suffix = shortcut_match.group(4)
+
+            downsample_part = 0 if op_type == "convolution" else 1
+            remapped[f"layer{stage_index}.{block_index}.downsample.{downsample_part}.{suffix}"] = value
+            continue
+
+        if normalized_key == "classifier.1.weight":
+            remapped["fc.weight"] = value
+            continue
+
+        if normalized_key == "classifier.1.bias":
+            remapped["fc.bias"] = value
+            continue
+
+        remapped[normalized_key] = value
+
+    return remapped
+
+
+def is_wrapped_resnet_checkpoint(state_dict: Dict[str, torch.Tensor]) -> bool:
+    keys = list(state_dict.keys())
+    return any(
+        key.startswith("resnet.embedder.embedder.")
+        or key.startswith("embedder.embedder.")
+        or key.startswith("resnet.encoder.stages.")
+        or key.startswith("encoder.stages.")
+        for key in keys
+    )
+
+
 class JsonlImagePromptDataset(Dataset):
     """Dataset that mirrors the user-provided JSONL + image-id convention."""
 
@@ -372,7 +448,18 @@ class EndToEndCAFEWithEncoders(nn.Module):
             if image_encoder_weights_path:
                 checkpoint = torch.load(image_encoder_weights_path, map_location="cpu")
                 state_dict = extract_state_dict(checkpoint)
-                self.image_encoder.load_state_dict(state_dict, strict=True)
+                if is_wrapped_resnet_checkpoint(state_dict):
+                    state_dict = remap_resnet_checkpoint_to_torchvision(state_dict)
+                    incompatible = self.image_encoder.load_state_dict(state_dict, strict=False)
+                    unexpected_non_fc = [key for key in incompatible.unexpected_keys if not key.startswith("fc.")]
+                    missing_non_fc = [key for key in incompatible.missing_keys if not key.startswith("fc.")]
+                    if unexpected_non_fc or missing_non_fc:
+                        raise RuntimeError(
+                            "Failed to remap the provided ResNet checkpoint into torchvision ResNet-34 format. "
+                            f"Missing non-fc keys: {missing_non_fc}; unexpected non-fc keys: {unexpected_non_fc}"
+                        )
+                else:
+                    self.image_encoder.load_state_dict(state_dict, strict=True)
             self.image_encoder.fc = nn.Identity()
 
         self.similarity_module = SimilarityModule()
