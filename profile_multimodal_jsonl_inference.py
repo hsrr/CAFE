@@ -230,6 +230,7 @@ class EndToEndCAFEWithEncoders(nn.Module):
         num_classes: int,
         text_feature_dim: int = 200,
         use_pretrained_image_encoder: bool = True,
+        image_encoder_weights_path: Optional[str] = None,
     ) -> None:
         super().__init__()
         if AutoModel is None or resnet34 is None:
@@ -239,11 +240,17 @@ class EndToEndCAFEWithEncoders(nn.Module):
         text_hidden_size = int(self.text_encoder.config.hidden_size)
         self.text_projector = nn.Linear(text_hidden_size, text_feature_dim)
 
-        if use_pretrained_image_encoder:
+        if image_encoder_weights_path:
+            weights = None
+        elif use_pretrained_image_encoder:
             weights = ResNet34_Weights.IMAGENET1K_V1 if ResNet34_Weights is not None else None
         else:
             weights = None
         self.image_encoder = resnet34(weights=weights)
+        if image_encoder_weights_path:
+            checkpoint = torch.load(image_encoder_weights_path, map_location="cpu")
+            state_dict = extract_state_dict(checkpoint)
+            self.image_encoder.load_state_dict(state_dict, strict=True)
         self.image_encoder.fc = nn.Identity()
 
         self.similarity_module = SimilarityModule()
@@ -304,6 +311,12 @@ def parse_args() -> argparse.Namespace:
         "--disable-pretrained-image-encoder",
         action="store_true",
         help="If set, ResNet-34 is initialized without ImageNet weights.",
+    )
+    parser.add_argument(
+        "--resnet34-weights-path",
+        type=str,
+        default=None,
+        help="Optional local ResNet-34 pretrained weights path to avoid auto-download.",
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Full model checkpoint.")
     parser.add_argument("--text-encoder-checkpoint", type=str, default=None)
@@ -381,7 +394,15 @@ def load_model_weights(model: EndToEndCAFEWithEncoders, args: argparse.Namespace
         "loaded": [],
         "encoder_sources": {
             "text_encoder_name_or_path": args.text_encoder_name_or_path,
-            "image_encoder": "resnet34-imagenet" if not args.disable_pretrained_image_encoder else "resnet34-random-init",
+            "image_encoder": (
+                args.resnet34_weights_path
+                if args.resnet34_weights_path
+                else (
+                    "resnet34-imagenet"
+                    if not args.disable_pretrained_image_encoder
+                    else "resnet34-random-init"
+                )
+            ),
         },
     }
 
@@ -436,6 +457,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> EndToEndCAFEW
         text_encoder_name_or_path=args.text_encoder_name_or_path,
         num_classes=args.num_classes,
         use_pretrained_image_encoder=not args.disable_pretrained_image_encoder,
+        image_encoder_weights_path=args.resnet34_weights_path,
     )
     model.to(device)
     model.eval()
