@@ -106,6 +106,12 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint for DetectionModule.",
     )
     parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=6,
+        help="Classifier output dimension.",
+    )
+    parser.add_argument(
         "--synthetic-samples",
         type=int,
         default=256,
@@ -132,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--synthetic-num-classes",
         type=int,
-        default=2,
+        default=None,
         help="Synthetic label classes for fallback data.",
     )
     parser.add_argument(
@@ -217,9 +223,9 @@ def maybe_load_checkpoints(
     return loaded
 
 
-def create_model(device: torch.device) -> EndToEndClassifier:
+def create_model(device: torch.device, num_classes: int) -> EndToEndClassifier:
     similarity_module = SimilarityModule()
-    detection_module = DetectionModule()
+    detection_module = DetectionModule(num_classes=num_classes)
     model = EndToEndClassifier(similarity_module, detection_module)
     model.eval()
     model.to(device)
@@ -231,12 +237,13 @@ def create_dataset(args: argparse.Namespace) -> Tuple[Dataset, str]:
         dataset = FeatureDataset(args.text_npz, args.image_npz)
         return dataset, "real"
 
+    synthetic_num_classes = args.synthetic_num_classes or args.num_classes
     dataset = SyntheticFeatureDataset(
         num_samples=args.synthetic_samples,
         seq_len=args.synthetic_seq_len,
         text_dim=args.synthetic_text_dim,
         image_dim=args.synthetic_image_dim,
-        num_classes=args.synthetic_num_classes,
+        num_classes=synthetic_num_classes,
     )
     return dataset, "synthetic"
 
@@ -554,7 +561,7 @@ def main() -> None:
         first_image.unsqueeze(0).to(device),
     )
 
-    model = create_model(device)
+    model = create_model(device, num_classes=args.num_classes)
     checkpoint_sources = maybe_load_checkpoints(
         model,
         combined_checkpoint=args.combined_checkpoint,
@@ -584,6 +591,7 @@ def main() -> None:
             "device": str(device),
             "dataset_mode": dataset_mode,
             "checkpoint_sources": checkpoint_sources,
+            "num_classes": args.num_classes,
             "batch_size": args.batch_size,
             "warmup_steps": args.warmup_steps,
             "single_sample_steps": args.single_sample_steps,

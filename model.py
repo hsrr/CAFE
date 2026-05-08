@@ -199,7 +199,7 @@ class CrossModule4Batch(nn.Module):
 
 
 class DetectionModule(nn.Module):
-    def __init__(self, feature_dim=64+16+16, h_dim=64):
+    def __init__(self, feature_dim=64+16+16, h_dim=64, num_classes=6):
         super(DetectionModule, self).__init__()
         self.encoding = EncodingPart()
         self.ambiguity_module = AmbiguityLearning()
@@ -214,7 +214,7 @@ class DetectionModule(nn.Module):
             nn.BatchNorm1d(h_dim),
             nn.ReLU(),
             # nn.Dropout(),
-            nn.Linear(h_dim, 2)
+            nn.Linear(h_dim, num_classes)
         )
 
     def forward(self, text_raw, image_raw, text, image):
