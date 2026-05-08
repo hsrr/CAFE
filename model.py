@@ -28,7 +28,7 @@ class FastCNN(nn.Module):
         x = x.permute(0, 2, 1)
         x_out = []
         for module in self.fast_cnn:
-            x_out.append(module(x).squeeze())
+            x_out.append(module(x).squeeze(-1))
         x_out = torch.cat(x_out, 1)
         return x_out
 
@@ -193,7 +193,7 @@ class CrossModule4Batch(nn.Module):
         corre_dim = text.shape[1]
         similarity = torch.matmul(text_in, image_in) / math.sqrt(corre_dim)
         correlation = self.softmax(similarity)
-        correlation_p = self.pooling(correlation).squeeze()
+        correlation_p = self.pooling(correlation).squeeze(-1)
         correlation_out = self.c_specific_2(correlation_p)
         return correlation_out
 
