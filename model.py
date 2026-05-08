@@ -1,6 +1,5 @@
 import math
 import random
-from random import random
 import torch
 import torch.nn as nn
 from torch.distributions import Normal, Independent
