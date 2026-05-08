@@ -93,11 +93,31 @@ class JsonlImagePromptDataset(Dataset):
     def _load_jsonl(self) -> List[Dict[str, Any]]:
         samples: List[Dict[str, Any]] = []
         with self.ann_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                item = json.loads(line)
+            raw_text = handle.read().strip()
+
+        if not raw_text:
+            return samples
+
+        # Support both jsonl and a regular JSON list/dict file because
+        # evaluation annotations are commonly stored in either format.
+        if self.ann_path.suffix.lower() == ".json":
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, list):
+                iterable = parsed
+            elif isinstance(parsed, dict):
+                iterable = parsed.get("data", parsed.get("annotations", []))
+            else:
+                raise ValueError(f"Unsupported JSON annotation structure in {self.ann_path}")
+
+            for item in iterable:
                 samples.append(self._preprocess_annotation(item))
+            return samples
+
+        for line in raw_text.splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            samples.append(self._preprocess_annotation(item))
         return samples
 
     def _preprocess_annotation(self, ann: Dict[str, Any]) -> Dict[str, Any]:
@@ -131,6 +151,8 @@ class JsonlImagePromptDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         sample = self.samples[index]
         image_path = self.image_root / f"{sample['id']}{self.image_extension}"
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found for sample {sample['id']}: {image_path}")
         image = Image.open(image_path).convert("RGB")
         text = sample["prompt"] if self.text_source == "prompt" else sample["caption"]
         return {
@@ -347,6 +369,22 @@ def ensure_runtime_dependencies() -> None:
         missing.append("torchvision")
     if missing:
         raise ImportError("Missing runtime dependencies: " + ", ".join(missing))
+
+
+def validate_paths(args: argparse.Namespace) -> None:
+    if args.ann_path and not Path(args.ann_path).exists():
+        raise FileNotFoundError(f"Annotation file not found: {args.ann_path}")
+    if args.image_root and not Path(args.image_root).exists():
+        raise FileNotFoundError(f"Image root not found: {args.image_root}")
+    if args.resnet34_weights_path:
+        weight_path = Path(args.resnet34_weights_path)
+        if not weight_path.exists():
+            raise FileNotFoundError(f"ResNet-34 weights file not found: {args.resnet34_weights_path}")
+        if weight_path.suffix.lower() == ".tflite":
+            raise ValueError(
+                "The provided ResNet-34 file is a TFLite model. "
+                "This profiler expects PyTorch weights (.pth/.pt) for the image encoder."
+            )
 
 
 def is_tensor_state_dict(candidate: Any) -> bool:
@@ -790,6 +828,7 @@ def print_report(report: Dict[str, Any]) -> None:
 def main() -> None:
     args = parse_args()
     ensure_runtime_dependencies()
+    validate_paths(args)
     device = torch.device(args.device)
 
     dataset, dataset_mode = build_dataset(args)
