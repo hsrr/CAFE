@@ -184,10 +184,14 @@ class JsonlImagePromptDataset(Dataset):
         if not raw_text:
             return samples
 
-        # Support both jsonl and a regular JSON list/dict file because
-        # evaluation annotations are commonly stored in either format.
-        if self.ann_path.suffix.lower() == ".json":
+        # Support both jsonl and regular JSON files. Some datasets use a `.json`
+        # suffix even though the contents are line-delimited JSON objects.
+        try:
             parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if parsed is not None:
             if isinstance(parsed, list):
                 iterable = parsed
             elif isinstance(parsed, dict):
